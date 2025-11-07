@@ -1,0 +1,27 @@
+# requirements.txt
+# FastAPI Mission Management System - Python Dependencies
+
+# FastAPI and ASGI server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# Database
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+alembic==1.12.1
+
+# Data validation
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Additional utilities
+python-multipart==0.0.6
+email-validator==2.1.0
+
+# Development dependencies (optional)
+# pytest==7.4.3
+# pytest-asyncio==0.21.1
+# httpx==0.25.1

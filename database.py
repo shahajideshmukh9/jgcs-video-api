@@ -2,7 +2,7 @@
 # Database Configuration and Connection Management
 
 from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base  # ✅ FIXED: Changed from sqlalchemy.ext.declarative
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 import os
@@ -14,7 +14,7 @@ load_dotenv()
 # Database URL from environment variable
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/jarbits_db"
+    "postgresql://postgres:digambar@localhost:5432/jarbits_db"
 )
 
 # Create SQLAlchemy engine

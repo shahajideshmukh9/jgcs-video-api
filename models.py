@@ -1,7 +1,8 @@
 # models.py
 # Pydantic Models for Request/Response Validation
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
+
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
@@ -93,7 +94,8 @@ class MissionCreate(BaseModel):
     vehicle_id: Optional[str] = Field(None, max_length=100, description="Assigned vehicle ID")
     operator_id: Optional[str] = Field(None, max_length=100, description="Assigned operator ID")
 
-    @validator('waypoints')
+    @field_validator('waypoints')
+    @classmethod
     def validate_waypoints(cls, v):
         if not v or len(v) == 0:
             raise ValueError('At least one waypoint is required')

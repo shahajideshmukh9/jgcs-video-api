@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from typing import List, Optional
 from datetime import datetime
 import uvicorn
+from pydantic import BaseModel
 
 from models import Mission, MissionCreate, MissionUpdate, MissionResponse, PaginatedMissionResponse
 from database import get_db, init_db
@@ -46,6 +47,17 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown code here
     # your shutdown logic
+
+class StatusUpdate(BaseModel):
+    """Model for updating mission status"""
+    status: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "status": "active"
+            }
+        }
 
 # Root endpoint
 @app.get("/", tags=["Root"])
@@ -266,6 +278,95 @@ async def search_missions(
         return missions
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to search missions: {str(e)}")
+
+
+# Update mission status
+@app.patch("/api/missions/{mission_id}/status", response_model=MissionResponse, tags=["Missions"])
+async def update_mission_status_endpoint(
+    mission_id: int,
+    status_update: StatusUpdate,
+    db: Session = Depends(get_db)
+):
+    """
+    Update the status of a mission
+    
+    - **mission_id**: The ID of the mission to update
+    - **status**: New status value
+    
+    Valid statuses: draft, pending, active, in_progress, paused, completed, failed, cancelled
+    
+    Valid transitions:
+    - draft → pending, cancelled
+    - pending → active, in_progress, cancelled
+    - active → paused, completed, failed
+    - in_progress → paused, completed, failed
+    - paused → active, in_progress, cancelled, failed
+    - completed, failed, cancelled → (no changes allowed)
+    """
+    try:
+        # Call the CRUD function to update status
+        db_mission = crud.update_mission_status(db, mission_id, status_update.status)
+        
+        if db_mission is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Mission with ID {mission_id} not found"
+            )
+        
+        return db_mission
+        
+    except ValueError as e:
+        # Handle validation errors (invalid status or transition)
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
+    except Exception as e:
+        # Handle unexpected errors
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update mission status: {str(e)}"
+        )
+
+
+# 🆕 OPTIONAL: Convenience endpoints for specific actions
+@app.post("/api/missions/{mission_id}/start", response_model=MissionResponse, tags=["Missions"])
+async def start_mission(
+    mission_id: int,
+    db: Session = Depends(get_db)
+):
+    """Start a mission (change status to 'active')"""
+    return await update_mission_status_endpoint(
+        mission_id,
+        StatusUpdate(status="active"),
+        db
+    )
+
+
+@app.post("/api/missions/{mission_id}/pause", response_model=MissionResponse, tags=["Missions"])
+async def pause_mission(
+    mission_id: int,
+    db: Session = Depends(get_db)
+):
+    """Pause a mission (change status to 'paused')"""
+    return await update_mission_status_endpoint(
+        mission_id,
+        StatusUpdate(status="paused"),
+        db
+    )
+
+
+@app.post("/api/missions/{mission_id}/complete", response_model=MissionResponse, tags=["Missions"])
+async def complete_mission(
+    mission_id: int,
+    db: Session = Depends(get_db)
+):
+    """Complete a mission (change status to 'completed')"""
+    return await update_mission_status_endpoint(
+        mission_id,
+        StatusUpdate(status="completed"),
+        db
+    )
 
 # Run the application
 if __name__ == "__main__":

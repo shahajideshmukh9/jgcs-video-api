@@ -348,3 +348,79 @@ def get_missions_by_corridor(db: Session) -> Dict:
     ).group_by(MissionDB.corridor_label).all()
     
     return {corridor or "No Corridor": count for corridor, count in corridor_counts}
+
+def update_mission_status( db: Session, mission_id: int, new_status: str) -> Optional[MissionDB]:
+    """
+    Update mission status with timestamp tracking
+    
+    Args:
+        db: Database session
+        mission_id: ID of the mission to update
+        new_status: New status ('active', 'paused', 'completed', etc.)
+        
+    Returns:
+        Updated mission object or None if not found
+        
+    Raises:
+        ValueError: If status transition is invalid
+    """
+    db_mission = db.query(MissionDB).filter(MissionDB.id == mission_id).first()
+    
+    if db_mission is None:
+        return None
+    
+    # Validate status
+    valid_statuses = ['draft', 'pending', 'active', 'in_progress', 'paused', 
+                    'completed', 'failed', 'cancelled']
+    if new_status.lower() not in valid_statuses:
+        raise ValueError(
+            f"Invalid status '{new_status}'. Must be one of: {', '.join(valid_statuses)}"
+        )
+    
+    # Check if status transition is valid
+    current_status = db_mission.status.lower() if db_mission.status else 'draft'
+    
+    # Define valid transitions
+    valid_transitions: Dict[str, list] = {
+        'draft': ['pending', 'cancelled'],
+        'pending': ['active', 'in_progress', 'cancelled'],
+        'active': ['paused', 'completed', 'failed'],
+        'in_progress': ['paused', 'completed', 'failed'],
+        'paused': ['active', 'in_progress', 'cancelled', 'failed'],
+        'completed': [],  # Cannot change from completed
+        'failed': [],     # Cannot change from failed
+        'cancelled': []   # Cannot change from cancelled
+    }
+    
+    if new_status.lower() not in valid_transitions.get(current_status, []):
+        raise ValueError(
+            f"Cannot transition from '{current_status}' to '{new_status}'"
+        )
+    
+    # Update status
+    old_status = db_mission.status
+    db_mission.status = new_status
+    db_mission.updated_at = datetime.utcnow()
+    
+    # Update timestamps based on new status
+    if new_status.lower() in ['active', 'in_progress']:
+        # Starting mission
+        if not db_mission.started_at:
+            db_mission.started_at = datetime.utcnow()
+    
+    elif new_status.lower() == 'paused':
+        # Pausing mission
+        db_mission.paused_at = datetime.utcnow()
+    
+    elif new_status.lower() == 'completed':
+        # Completing mission
+        if not db_mission.completed_at:
+            db_mission.completed_at = datetime.utcnow()
+    
+    # Commit changes
+    db.commit()
+    db.refresh(db_mission)
+    
+    print(f"✅ Mission {mission_id} status: {old_status} → {new_status}")
+    
+    return db_mission

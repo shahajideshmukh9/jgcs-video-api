@@ -1,8 +1,7 @@
-# database.py
 # Database Configuration and Connection Management
 
 from sqlalchemy import create_engine
-from sqlalchemy.orm import declarative_base  # ✅ FIXED: Changed from sqlalchemy.ext.declarative
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 import os

@@ -1,6 +1,3 @@
-# requirements.txt
-# FastAPI Mission Management System - Python Dependencies
-
 # FastAPI and ASGI server
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
@@ -20,6 +17,13 @@ python-dotenv==1.0.0
 # Additional utilities
 python-multipart==0.0.6
 email-validator==2.1.0
+
+# Drone control dependencies
+pymavlink==2.4.41
+redis==5.0.1
+
+# WebSocket support (included in uvicorn[standard])
+websockets==12.0
 
 # Development dependencies (optional)
 # pytest==7.4.3

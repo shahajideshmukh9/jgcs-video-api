@@ -721,7 +721,7 @@ class GazeboSimulatorController:
             self.logger.info("✓ Takeoff command accepted, monitoring altitude...")
             
             # Now monitor altitude until target reached
-            return self._monitor_altitude_climb(altitude, timeout=60)
+            return self._monitor_altitude_climb(altitude, timeout=180)
             
         except Exception as e:
             self.logger.error(f"Takeoff failed with exception: {e}")
@@ -732,7 +732,7 @@ class GazeboSimulatorController:
     # STEP 3: Add this helper method
     # ============================================================================
 
-    def _monitor_altitude_climb(self, target_altitude, timeout=60):
+    def _monitor_altitude_climb(self, target_altitude, timeout=180):
         """
         Monitor altitude climb during takeoff
         
@@ -4050,47 +4050,62 @@ async def api_health():
         "active_connections": active_sessions
     }
 
-@app.get("/status")
 @app.get("/api/status")
-async def get_api_status():
-    """Get system status"""
+@app.get("/status", response_model=ApiResponse, tags=["Status"])
+async def get_status():
+    """
+    📊 GET DRONE STATUS
+    
+    Returns comprehensive drone status including armed state, connection status,
+    position, battery, and mission information.
+    """
+    global sim_controller, drone_state
+    
     try:
-        if not redis_client:
-            return JSONResponse({
-                'status': 'error',
-                'redis': 'disconnected',
-                'timestamp': datetime.now().isoformat()
-            })
+        # Update state from telemetry before returning
+        if sim_controller and sim_controller._is_connected:
+            await update_drone_state_from_telemetry()
         
-        redis_client.ping()
-        
-        # Count keys
-        all_keys = []
-        cursor = 0
-        while True:
-            cursor, keys = redis_client.scan(cursor=cursor, match="*", count=100)
-            all_keys.extend(keys)
-            if cursor == 0:
-                break
-        
-        mission_count = len([k for k in all_keys if 'mission' in k.lower()])
-        telemetry_count = len([k for k in all_keys if 'telemetry' in k.lower()])
-        
-        return JSONResponse({
-            'status': 'success',
-            'redis': 'connected',
-            'total_keys': len(all_keys),
-            'mission_count': mission_count,
-            'telemetry_count': telemetry_count,
-            'timestamp': datetime.now().isoformat()
-        })
+        # Return the complete drone state
+        return ApiResponse(
+            success=True,
+            message="Drone status retrieved successfully",
+            data={
+                "connected": drone_state["connected"],
+                "armed": drone_state["armed"],
+                "flying": drone_state["flying"],
+                "current_position": drone_state["current_position"],
+                "home_position": drone_state["home_position"],
+                "battery_level": drone_state["battery_level"],
+                "flight_mode": drone_state["flight_mode"],
+                "mission_active": drone_state["mission_active"],
+                "mission_current": drone_state["mission_current"],
+                "mission_count": drone_state["mission_count"],
+                "last_update": drone_state.get("last_update", datetime.now().isoformat()),
+                "message": "Status OK" if drone_state["connected"] else "Not connected"
+            }
+        )
+    
     except Exception as e:
-        logger.error(f"Status check failed: {e}")
-        return JSONResponse({
-            'status': 'error',
-            'message': str(e),
-            'timestamp': datetime.now().isoformat()
-        })
+        logger.error(f"Error getting status: {e}", exc_info=True)
+        return ApiResponse(
+            success=False,
+            message=f"Error retrieving status: {str(e)}",
+            data={
+                "connected": False,
+                "armed": False,
+                "flying": False,
+                "current_position": {"lat": 0, "lon": 0, "alt": 0},
+                "home_position": {"lat": 0, "lon": 0, "alt": 0},
+                "battery_level": 0,
+                "flight_mode": "UNKNOWN",
+                "mission_active": False,
+                "mission_current": 0,
+                "mission_count": 0,
+                "last_update": datetime.now().isoformat(),
+                "message": "Status error"
+            }
+        )
 
 @app.get("/api/missions")
 async def get_missions():
@@ -4781,7 +4796,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "gazebo_rest_api:app",
         host="127.0.0.1",
-        port=8000,
+        port=7000,
         reload=True,
         log_level="info"
     )

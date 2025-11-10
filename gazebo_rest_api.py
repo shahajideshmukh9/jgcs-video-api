@@ -679,68 +679,134 @@ class GazeboSimulatorController:
     # STEP 2: Update your existing takeoff() method
     # ============================================================================
 
-    def takeoff(self, altitude):
+    def takeoff(self, altitude: float) -> bool:
         """
-        Execute takeoff with proper acknowledgment handling
+        Execute takeoff with proper mode handling
         
-        REPLACE YOUR EXISTING takeoff() METHOD WITH THIS
-        """        
+        Args:
+            altitude: Target altitude in meters
+            
+        Returns:
+            True if takeoff successful
+        """
         if not self._is_connected:
             self.logger.error("Not connected to vehicle")
             return False
         
         try:
-            self.logger.info(f"Commanding takeoff to {altitude}m...")
+            self.logger.info(f"=" * 60)
+            self.logger.info(f"TAKEOFF SEQUENCE - Target: {altitude}m")
+            self.logger.info(f"=" * 60)
             
-            # Send takeoff command
+            # Step 1: Stop OFFBOARD setpoints if active
+            if self._offboard_active:
+                self.logger.info("Step 1: Stopping OFFBOARD setpoints...")
+                self._stop_offboard_setpoints()
+                time.sleep(0.5)
+            
+            # Step 2: Switch to GUIDED mode (required for takeoff command)
+            self.logger.info("Step 2: Switching to GUIDED mode...")
+            if not self.set_mode_guided():
+                self.logger.warning("⚠ Failed to set GUIDED mode, trying anyway...")
+            
+            time.sleep(1)  # Give mode change time to settle
+            
+            # Step 3: Send takeoff command
+            self.logger.info(f"Step 3: Sending TAKEOFF command to {altitude}m...")
+            
             self.mav_connection.mav.command_long_send(
                 self.target_system,
                 self.target_component,
                 mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
                 0,  # confirmation
-                0,  # param1: pitch
+                0,  # param1: pitch (unused)
                 0,  # param2: empty
                 0,  # param3: empty
-                float('nan'),  # param4: yaw angle (NaN for current)
-                0,  # param5: latitude (0 for current)
-                0,  # param6: longitude (0 for current)
+                float('nan'),  # param4: yaw angle (NaN = current)
+                0,  # param5: latitude (0 = current)
+                0,  # param6: longitude (0 = current)
                 altitude  # param7: altitude
             )
             
-            # *** CRITICAL FIX: Wait for command acknowledgment ***
-            self.logger.info("Waiting for takeoff acknowledgment...")
-            success, result = self.wait_for_command_ack(
-                mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-                timeout=5
-            )
+            # Step 4: Wait for command acknowledgment
+            self.logger.info("Step 4: Waiting for TAKEOFF acknowledgment...")
             
-            if not success:
-                self.logger.error("TAKEOFF command failed")
-                return False
+            start_time = time.time()
+            while (time.time() - start_time) < 10:
+                msg = self.mav_connection.recv_match(
+                    type='COMMAND_ACK',
+                    blocking=True,
+                    timeout=1.0
+                )
+                
+                if msg and msg.command == mavutil.mavlink.MAV_CMD_NAV_TAKEOFF:
+                    if msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                        self.logger.info("✓ TAKEOFF command accepted")
+                        break
+                    else:
+                        self.logger.error(f"TAKEOFF command rejected: {msg.result}")
+                        return False
             
-            self.logger.info("✓ Takeoff command accepted, monitoring altitude...")
-            
-            # Now monitor altitude until target reached
-            return self._monitor_altitude_climb(altitude, timeout=180)
+            # Step 5: Monitor altitude climb
+            self.logger.info("Step 5: Monitoring altitude climb...")
+            return self._monitor_altitude_climb(altitude, timeout=240)
             
         except Exception as e:
-            self.logger.error(f"Takeoff failed with exception: {e}")
+            self.logger.error(f"Takeoff failed: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
             return False
 
 
-    # ============================================================================
-    # STEP 3: Add this helper method
-    # ============================================================================
+    def set_mode_guided(self) -> bool:
+        """
+        Set vehicle to GUIDED mode (required for takeoff in PX4)
+        """
+        try:
+            self.logger.info("Setting mode to GUIDED...")
+            
+            # For PX4: GUIDED mode is represented as AUTO.LOITER
+            # Main mode = 4 (AUTO), Sub mode = 3 (LOITER)
+            custom_mode = (4 << 16) | 3
+            
+            self.mav_connection.mav.set_mode_send(
+                self.target_system,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                custom_mode
+            )
+            
+            # Wait for mode change confirmation
+            start_time = time.time()
+            while (time.time() - start_time) < 5:
+                msg = self.mav_connection.recv_match(
+                    type='HEARTBEAT',
+                    blocking=True,
+                    timeout=1
+                )
+                
+                if msg:
+                    curr_mode = msg.custom_mode
+                    main = (curr_mode >> 16) & 0xFF
+                    
+                    if main == 4:  # AUTO mode family
+                        self.logger.info("✓ Mode set to GUIDED (AUTO.LOITER)")
+                        return True
+            
+            self.logger.warning("Mode change to GUIDED not confirmed")
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Failed to set GUIDED mode: {e}")
+            return False
 
-    def _monitor_altitude_climb(self, target_altitude, timeout=180):
+
+    def _monitor_altitude_climb(self, target_altitude: float, timeout: int = 240) -> bool:
         """
         Monitor altitude climb during takeoff
         
-        ADD THIS NEW METHOD if you don't have it
-        
         Args:
             target_altitude: Target altitude in meters
-            timeout: Maximum time to wait
+            timeout: Maximum time to wait (seconds)
             
         Returns:
             bool: True if altitude reached
@@ -763,12 +829,18 @@ class GazeboSimulatorController:
                 
                 # Log every 2 seconds
                 if current_time - last_log_time >= 2:
-                    self.logger.info(f"  Current altitude: {current_alt:.1f}m / {target_altitude}m")
+                    progress = (current_alt / target_altitude) * 100
+                    self.logger.info(
+                        f"  Climbing: {current_alt:.1f}m / {target_altitude}m "
+                        f"({progress:.0f}%)"
+                    )
                     last_log_time = current_time
                 
-                # Check if we've reached target (with 10% tolerance)
+                # Check if we've reached target (with 90% tolerance)
                 if current_alt >= target_altitude * 0.9:
-                    self.logger.info(f"✓ Reached target altitude: {current_alt:.1f}m")
+                    self.logger.info(f"=" * 60)
+                    self.logger.info(f"✅ TAKEOFF COMPLETE - Altitude: {current_alt:.1f}m")
+                    self.logger.info(f"=" * 60)
                     return True
         
         self.logger.warning(f"⚠ Altitude climb timeout after {timeout}s")
@@ -3125,72 +3197,34 @@ async def disarm_vehicle(request: VehicleDisarmRequest):
 @app.post("/api/v1/vehicle/takeoff", response_model=ApiResponse, tags=["Vehicle Commands"])
 async def takeoff_vehicle(request: TakeoffRequest):
     """
-    🚁 TAKEOFF
-    
-    Commands the vehicle to take off to the specified altitude.
-    
-    **Prerequisites:**
-    - Vehicle must be armed
-    - GPS lock required
-    
-    **Request Body:**
-    - mission_id: Mission identifier
-    - altitude: Target altitude in meters (1-100m)
-    
-    **Returns:**
-    - Success response with takeoff status
-    
-    **Example:**
-    ```json
-    {
-        "mission_id": "MISSION-001",
-        "altitude": 15.0
-    }
-    ```
+    🚁 TAKEOFF VEHICLE
     """
     global sim_controller, drone_state
     
-    # Check if connected
     if not sim_controller or not sim_controller._is_connected:
-        logger.error("TAKEOFF failed: Not connected to simulator")
-        raise HTTPException(
-            status_code=503, 
-            detail="Not connected to simulator"
-        )
+        raise HTTPException(status_code=503, detail="Not connected to simulator")
     
     # Check if armed
+    await update_drone_state_from_telemetry()
+    
     if not drone_state["armed"]:
-        logger.error("TAKEOFF failed: Vehicle not armed")
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail="Vehicle must be armed before takeoff. Arm the vehicle first."
         )
     
     try:
         logger.info(f"🚁 Initiating takeoff to {request.altitude}m for mission {request.mission_id}")
         
+        # Call the fixed takeoff method
         success = sim_controller.takeoff(request.altitude)
         
         if success:
             drone_state["flying"] = True
             
-            # Create event
-            create_event(
-                EventType.VEHICLE.value,
-                "vehicle_command",
-                {
-                    "command": "takeoff",
-                    "mission_id": request.mission_id,
-                    "altitude": request.altitude,
-                    "timestamp": datetime.now().isoformat()
-                }
-            )
-            
-            logger.info(f"✅ Takeoff command sent - climbing to {request.altitude}m")
-            
             return ApiResponse(
                 success=True,
-                message=f"Takeoff initiated to {request.altitude}m",
+                message=f"Takeoff successful - reached {request.altitude}m",
                 data={
                     "altitude": request.altitude,
                     "mission_id": request.mission_id,
@@ -3199,20 +3233,16 @@ async def takeoff_vehicle(request: TakeoffRequest):
                 }
             )
         else:
-            logger.error("TAKEOFF command failed")
             raise HTTPException(
-                status_code=500, 
-                detail="Failed to initiate takeoff"
+                status_code=500,
+                detail="Takeoff failed - altitude not reached. Check PX4 console for errors."
             )
             
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"❌ Takeoff error: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Takeoff command failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Takeoff failed: {str(e)}")
 
 
 @app.post("/api/v1/vehicle/land", response_model=ApiResponse, tags=["Vehicle Commands"])

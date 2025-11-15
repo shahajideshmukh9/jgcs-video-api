@@ -4,7 +4,7 @@
 # IMPORTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator, ConfigDict
@@ -3879,26 +3879,42 @@ async def stop_video():
 # WebSocket Real-time Streaming
 @app.websocket("/ws/telemetry")
 async def websocket_telemetry(websocket: WebSocket):
-    """Real-time telemetry WebSocket"""
+    """Real-time telemetry WebSocket - 2Hz update rate"""
     await websocket.accept()
     logger.info("WebSocket client connected")
     
     try:
         while True:
             if drone_state["connected"]:
+                # Update drone state from PX4 SITL
                 await update_drone_state_from_telemetry()
                 pos = drone_state["current_position"]
-                violated, msg = check_geofence_violation(pos["lat"], pos["lon"], pos["alt"])
                 
+                # Check geofence violations
+                violated, msg = check_geofence_violation(
+                    pos["lat"], pos["lon"], pos["alt"]
+                )
+                
+                # Prepare telemetry data
                 data = {
+                    "type": "telemetry_update",
                     "timestamp": datetime.now().isoformat(),
                     "drone_state": drone_state,
                     "telemetry": sim_controller.get_telemetry() if sim_controller else {},
+                    "position": {
+                        "lat": pos["lat"],
+                        "lon": pos["lon"],
+                        "alt": pos["alt"]
+                    },
                     "geofence_violation": violated,
                     "geofence_message": msg
                 }
+                
                 await websocket.send_json(data)
+            
+            # 2Hz update rate (500ms interval)
             await asyncio.sleep(0.5)
+            
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
     except Exception as e:
@@ -4274,6 +4290,306 @@ async def get_missions():
             'status': 'error',
             'message': str(e)
         })
+    
+@app.get("/api/qt/missions", tags=["Missions"])
+async def get_qt_missions(
+    status: Optional[str] = Query(None, description="Filter by mission status"),
+    corridor: Optional[str] = Query(None, description="Filter by corridor value"),
+    mission_type: Optional[str] = Query(None, description="Filter by mission type"),
+    created_by: Optional[str] = Query(None, description="Filter by creator"),
+    limit: int = Query(100, ge=1, le=1000, description="Number of results to return"),
+    offset: int = Query(0, ge=0, description="Number of results to skip")
+):
+    """
+    Retrieve all missions with optional filters and pagination
+    Qt Client Compatible Response Format
+    """
+    try:
+        # Build query parameters
+        params = {
+            "limit": limit,
+            "offset": offset
+        }
+        
+        if status:
+            params["status"] = status
+        if corridor:
+            params["corridor"] = corridor
+        if mission_type:
+            params["mission_type"] = mission_type
+        if created_by:
+            params["created_by"] = created_by
+        
+        logger.info(f"Fetching missions from Mission DB API with params: {params}")
+
+        import httpx
+        
+        # Make HTTP request to Mission Database API
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                response = await client.get(
+                    f"http://localhost:7000/api/missions",
+                    params=params
+                )
+                response.raise_for_status()
+                db_data = response.json()
+                
+                logger.info(f"✓ Successfully fetched {len(db_data.get('missions', []))} missions")
+                
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+                logger.warning(f"⚠ Mission Database API error - falling back to Redis")
+                return await get_qt_missions_from_redis(
+                    status, corridor, mission_type, created_by, limit, offset
+                )
+        
+        # Extract and convert missions to Qt format
+        missions = db_data.get("missions", [])
+        total_count = db_data.get("total_count", len(missions))
+        
+        qt_missions = []
+        
+        for mission in missions:
+            qt_mission = {
+                "mission_id": str(mission.get("id", mission.get("mission_id", ""))),
+                "name": mission.get("mission_name", mission.get("name", "")),
+                "mission_name": mission.get("mission_name", mission.get("name", "")),
+                "description": mission.get("notes", mission.get("description", "")),
+                "corridor": mission.get("corridor_value", mission.get("corridor", "unknown")),
+                "status": mission.get("status", "unknown"),
+                "vehicle_id": mission.get("vehicle_id", ""),
+                "operator_id": mission.get("operator_id", ""),
+                "mission_type": mission.get("mission_type", ""),
+                "created_at": mission.get("created_at", ""),
+                "updated_at": mission.get("updated_at", ""),
+                "created_by": mission.get("created_by", ""),
+                "waypoints": []
+            }
+            
+            # Parse waypoints
+            waypoints = mission.get("waypoints", [])
+            if isinstance(waypoints, str):
+                try:
+                    waypoints = json.loads(waypoints)
+                except:
+                    waypoints = []
+            
+            # Convert waypoints to Qt format
+            for idx, wp in enumerate(waypoints):
+                if isinstance(wp, dict):
+                    qt_waypoint = {
+                        "sequence": idx,
+                        "latitude": float(wp.get("lat", wp.get("latitude", 0))),
+                        "longitude": float(wp.get("lng", wp.get("lon", wp.get("longitude", 0)))),
+                        "altitude": float(wp.get("alt", wp.get("altitude", 0))),
+                        "action": wp.get("action", "WAYPOINT")
+                    }
+                    qt_mission["waypoints"].append(qt_waypoint)
+            
+            # Add mission stats if available
+            stats = mission.get("mission_stats", {})
+            if isinstance(stats, str):
+                try:
+                    stats = json.loads(stats)
+                except:
+                    stats = {}
+            
+            if stats:
+                qt_mission["total_distance"] = stats.get("distance", 0)
+                qt_mission["estimated_time"] = stats.get("time", 0)
+                qt_mission["battery_required"] = stats.get("battery", 0)
+            
+            qt_missions.append(qt_mission)
+        
+        # Return Qt-compatible response
+        return {
+            "success": True,
+            "missions": qt_missions,
+            "total_count": total_count,
+            "pagination": {
+                "total": total_count,
+                "limit": limit,
+                "offset": offset,
+                "has_more": offset + limit < total_count,
+                "returned": len(qt_missions)
+            },
+            "filters_applied": {
+                "status": status,
+                "corridor": corridor,
+                "mission_type": mission_type,
+                "created_by": created_by
+            },
+            "data_source": "mission_database_api"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in get_qt_missions: {e}", exc_info=True)
+        try:
+            return await get_qt_missions_from_redis(
+                status, corridor, mission_type, created_by, limit, offset
+            )
+        except:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to retrieve missions: {str(e)}"
+            )
+
+
+async def get_qt_missions_from_redis(
+    status: Optional[str],
+    corridor: Optional[str],
+    mission_type: Optional[str],
+    created_by: Optional[str],
+    limit: int,
+    offset: int
+):
+    """Fallback function to get missions from Redis"""
+    try:
+        logger.info("🔄 Using Redis fallback for missions")
+        
+        # Get all mission keys from Redis
+        all_keys = []
+        cursor = 0
+        
+        while True:
+            cursor, keys = redis_client.scan(
+                cursor=cursor,
+                match="mavlink:missions:*",
+                count=100
+            )
+            all_keys.extend(keys)
+            if cursor == 0:
+                break
+        
+        logger.info(f"Found {len(all_keys)} mission keys in Redis")
+        
+        missions = []
+        
+        for key in all_keys:
+            try:
+                # Decode key if bytes
+                if isinstance(key, bytes):
+                    key = key.decode('utf-8')
+                
+                key_type = redis_client.type(key)
+                if isinstance(key_type, bytes):
+                    key_type = key_type.decode('utf-8')
+                
+                mission_id = key.split(':')[-1] if ':' in key else key
+                
+                # Get mission data based on type
+                mission_data = None
+                
+                if key_type == 'string':
+                    data_str = redis_client.get(key)
+                    if isinstance(data_str, bytes):
+                        data_str = data_str.decode('utf-8')
+                    mission_data = json.loads(data_str)
+                    
+                elif key_type == 'hash':
+                    data = redis_client.hgetall(key)
+                    mission_data = {}
+                    for k, v in data.items():
+                        key_str = k.decode('utf-8') if isinstance(k, bytes) else k
+                        val_str = v.decode('utf-8') if isinstance(v, bytes) else v
+                        mission_data[key_str] = val_str
+                
+                if not mission_data:
+                    continue
+                
+                # Apply filters
+                if status and mission_data.get('status') != status:
+                    continue
+                if corridor and mission_data.get('corridor_value') != corridor:
+                    continue
+                if mission_type and mission_data.get('mission_type') != mission_type:
+                    continue
+                if created_by and mission_data.get('created_by') != created_by:
+                    continue
+                
+                # Parse waypoints
+                waypoints = []
+                if 'waypoints' in mission_data:
+                    wp_data = mission_data['waypoints']
+                    if isinstance(wp_data, str):
+                        try:
+                            waypoints = json.loads(wp_data)
+                        except:
+                            pass
+                    elif isinstance(wp_data, list):
+                        waypoints = wp_data
+                
+                # Convert to Qt format
+                qt_waypoints = []
+                for idx, wp in enumerate(waypoints):
+                    if isinstance(wp, dict):
+                        qt_waypoint = {
+                            "sequence": idx,
+                            "latitude": float(wp.get("lat", wp.get("latitude", 0))),
+                            "longitude": float(wp.get("lon", wp.get("lng", wp.get("longitude", 0)))),
+                            "altitude": float(wp.get("alt", wp.get("altitude", 0))),
+                            "action": "TAKEOFF" if idx == 0 else (
+                                "LAND" if idx == len(waypoints) - 1 else "WAYPOINT"
+                            )
+                        }
+                        qt_waypoints.append(qt_waypoint)
+                
+                qt_mission = {
+                    "mission_id": mission_data.get("mission_id", mission_id),
+                    "name": mission_data.get("name", mission_data.get("mission_name", f"Mission {mission_id}")),
+                    "mission_name": mission_data.get("name", mission_data.get("mission_name", f"Mission {mission_id}")),
+                    "description": mission_data.get("description", mission_data.get("notes", "")),
+                    "corridor": mission_data.get("corridor_value", mission_data.get("corridor", "unknown")),
+                    "status": mission_data.get("status", "unknown"),
+                    "vehicle_id": mission_data.get("vehicle_id", ""),
+                    "operator_id": mission_data.get("operator_id", ""),
+                    "mission_type": mission_data.get("mission_type", ""),
+                    "created_at": mission_data.get("uploaded_at", mission_data.get("created_at", "")),
+                    "updated_at": mission_data.get("updated_at", ""),
+                    "created_by": mission_data.get("created_by", ""),
+                    "waypoints": qt_waypoints
+                }
+                
+                missions.append(qt_mission)
+                
+            except Exception as e:
+                logger.error(f"Error processing Redis mission {key}: {e}")
+                continue
+        
+        # Sort by created_at (newest first)
+        missions.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        
+        # Apply pagination
+        total_count = len(missions)
+        paginated_missions = missions[offset:offset + limit]
+        
+        logger.info(f"✓ Retrieved {len(paginated_missions)} missions from Redis")
+        
+        return {
+            "success": True,
+            "missions": paginated_missions,
+            "total_count": total_count,
+            "pagination": {
+                "total": total_count,
+                "limit": limit,
+                "offset": offset,
+                "has_more": offset + limit < total_count,
+                "returned": len(paginated_missions)
+            },
+            "filters_applied": {
+                "status": status,
+                "corridor": corridor,
+                "mission_type": mission_type,
+                "created_by": created_by
+            },
+            "data_source": "redis_fallback"
+        }
+        
+    except Exception as e:
+        logger.error(f"Redis fallback error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve missions from Redis: {str(e)}"
+        )
 
 @app.get("/api/missions/{mission_id}")
 async def get_mission_details(mission_id: str):
